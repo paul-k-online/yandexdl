@@ -1453,6 +1453,25 @@ def is_transient(e) -> bool:
     return False
 
 
+def error_kind(e) -> str:
+    """Категория ошибки для статистики и решения о ретрае:
+       'gone'      — 410: объект недоступен на бэкенде (ретраить бессмысленно);
+       'retry'     — таймаут/обрыв/5xx/403: стоит повторить (403 — протухла ссылка);
+       'permanent' — всё прочее (напр. html вместо файла)."""
+    if isinstance(e, urllib.error.HTTPError):
+        if e.code == 410:
+            return "gone"
+        if e.code == 403 or e.code in TRANSIENT_HTTP:
+            return "retry"
+        return "permanent"
+    if is_transient(e):
+        return "retry"
+    return "permanent"
+
+
+
+
+
 def build_opener():
     # Скачиваем напрямую: системные/переменные прокси (в т.ч. сам mitmproxy) игнорируем.
     handlers = [urllib.request.ProxyHandler({})]
@@ -1554,9 +1573,13 @@ class Downloader:
         self.stop_event.set()
 
     def retry_failed(self):
+        # «Повторить ошибки» -> в очередь БИТЫХ (bad), а не в основной канал:
+        # пусть пробуют заново оригинал + миниатюры с ретраями, не мешая основному
+        # потоку свежих файлов. Сбрасываем счётчик мягких попыток и backoff.
         with dbc() as c:
             cur = c.execute(
-                "UPDATE items SET dl_status=NULL, dl_error=NULL, dl_attempts=NULL WHERE dl_status='failed'"
+                "UPDATE items SET dl_status='bad', dl_error=NULL, dl_attempts=NULL, dl_at=NULL "
+                "WHERE dl_status='failed'"
             )
             return cur.rowcount
 
@@ -1720,7 +1743,7 @@ class Downloader:
         Там отдельный пул докачает меньший размер, не занимая основной канал."""
         with dbc() as c:
             c.execute(
-                "UPDATE items SET dl_status='bad', dl_error=?, dl_at=NULL WHERE path=?",
+                "UPDATE items SET dl_status='bad', dl_error=?, dl_attempts=NULL, dl_at=NULL WHERE path=?",
                 ((error or "ORIGINAL недоступен")[:300], path),
             )
 
@@ -1761,61 +1784,68 @@ class Downloader:
             return {}
 
     def _process_main(self, row):
-        """ОСНОВНОЙ канал: качает только ORIGINAL (до self.original_tries попыток).
-        Успех -> done. Оригинал не отдался (временная ошибка) -> переносим файл в
-        очередь битых (bad), НЕ занимая основной поток перебором превью."""
+        """ОСНОВНОЙ канал: ОДНА попытка ORIGINAL, без ретраев — снимаем «сливки»
+        (живые оригиналы), не застревая. Успех -> done. Любая неудача -> файл
+        сразу в очередь битых (bad) с записью ошибки оригинала. Все ретраи и
+        миниатюры — уже в канале битых."""
         path, name = row["path"], row["name"]
         day = (row["taken"] or "")[:10] or "no-date"
         sizes = self._sizes_of(row)
+        if not sizes:
+            self._record_fail(path, "нет ссылок на скачивание", [])
+            return
         url = sizes.get("ORIGINAL")
         if not url:
-            # Оригинала в ссылках нет вовсе — сразу в битые (там докачают превью).
-            if sizes:
-                self._mark_bad(path, "нет ссылки на ORIGINAL")
-            else:
-                self._record_fail(path, "нет ссылок на скачивание", [])
+            self._mark_bad(path, "нет ссылки на ORIGINAL")
             return
         if url.startswith("//"):
             url = "https:" + url
 
+        tries = max(1, self.original_tries)
         prog = {"name": name, "size": "ORIGINAL", "bytes": 0, "total": None,
-                "attempt": 1, "of": self.original_tries, "since": time.time()}
+                "attempt": 1, "of": tries, "since": time.time()}
         with self.alock:
             self.active[path] = prog
-        attempts = []
+        last_err = None
         try:
-            for i in range(1, self.original_tries + 1):
+            for i in range(1, tries + 1):
                 if self.stop_event.is_set():
-                    raise Aborted()
+                    self._set_item(path, None)
+                    return
                 prog.update(bytes=0, total=None, attempt=i)
                 try:
                     rel, nbytes = self._fetch(path, name, day, "ORIGINAL", url, prog)
                 except Aborted:
-                    raise
+                    self._set_item(path, None)
+                    return
                 except Exception as e:  # noqa: BLE001
-                    attempts.append(f"ORIGINAL#{i}: {short_err(e)}")
+                    last_err = short_err(e)
+                    if error_kind(e) == "gone":
+                        break   # 410 — повтор оригинала бессмыслен, сразу в битые
                     continue
-                self._set_item(path, "done", size="ORIGINAL", file=rel, nbytes=nbytes, attempts=attempts)
+                self._set_item(path, "done", size="ORIGINAL", file=rel, nbytes=nbytes)
                 self._on_result(True, nbytes)
                 return
-            # ORIGINAL так и не дался -> в очередь битых (докачать меньший размер).
-            self._mark_bad(path, "; ".join(attempts))
-        except Aborted:
-            self._set_item(path, None)
+            # Оригинал не дался за все попытки — в очередь битых (ретраи + миниатюры).
+            self._mark_bad(path, f"ORIGINAL: {last_err or 'не удалось'}")
         finally:
             with self.alock:
                 self.active.pop(path, None)
 
     def _process_bad(self, row):
-        """КАНАЛ БИТЫХ: оригинала нет, докачиваем меньший размер (XXXL -> ... ->
-        DEFAULT), чтобы было хоть что-то. Временная ошибка -> soft-retry в очередь
-        битых с backoff; исчерпали -> failed."""
+        """КАНАЛ БИТЫХ: вся «тяжёлая» работа и ретраи. Пробует СНАЧАЛА ORIGINAL
+        (вдруг ожил), затем миниатюры XXXL->...->DEFAULT. Решение по ошибкам:
+          - скачали что-то -> done (метка размера; не-ORIGINAL = уменьшенная копия);
+          - была хоть одна ВРЕМЕННАЯ ошибка (403/5xx/timeout/обрыв) и лимит ретраев
+            не исчерпан -> назад в очередь битых с backoff;
+          - все ошибки «gone/permanent» (410/404) -> failed сразу (ретрай бессмыслен);
+          - лимит ретраев исчерпан -> failed."""
         path, name = row["path"], row["name"]
         day = (row["taken"] or "")[:10] or "no-date"
         sizes = self._sizes_of(row)
-        order = [s for s in SIZE_ORDER if s != "ORIGINAL" and s in sizes]
+        order = [s for s in SIZE_ORDER if s in sizes]   # начинаем с ORIGINAL
         if not order:
-            self._record_fail(path, "нет превью-ссылок (только ORIGINAL)", [])
+            self._record_fail(path, "нет ссылок на скачивание", [])
             return
 
         prog = {"name": name, "size": order[0], "bytes": 0, "total": None,
@@ -1823,7 +1853,8 @@ class Downloader:
         with self.alock:
             self.active_bad[path] = prog
         attempts = []
-        had_transient = False
+        had_retry = False     # была временная ошибка -> стоит повторить позже
+        all_gone = True       # все ошибки были 410/404 -> ретрай бессмыслен
         try:
             for i, size in enumerate(order, 1):
                 if self.stop_event.is_set():
@@ -1838,17 +1869,22 @@ class Downloader:
                     raise
                 except Exception as e:  # noqa: BLE001
                     attempts.append(f"{size}: {short_err(e)}")
-                    if is_transient(e):
-                        had_transient = True
+                    kind = error_kind(e)
+                    if kind == "retry":
+                        had_retry = True
+                        all_gone = False
+                    elif kind == "permanent":
+                        all_gone = False
                     continue
                 self._set_item(path, "done", size=size, file=rel, nbytes=nbytes, attempts=attempts)
                 self._on_result(True, nbytes)
                 return
-            if had_transient:
+            if had_retry:
                 n = self._soft_attempts(path) + 1
                 if n <= SOFT_RETRY_MAX:
                     self._requeue_soft(path, n, "; ".join(attempts), attempts, status="bad")
                     return
+            # недоступно на бэкенде (410) или исчерпали ретраи -> failed
             self._record_fail(path, "; ".join(attempts), attempts)
         except Aborted:
             self._set_item(path, "bad")   # остановка пользователем — вернуть в очередь битых
