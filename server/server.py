@@ -1503,11 +1503,17 @@ class Downloader:
         self.bad_workers = {}              # пул битых: idx -> Thread
         self.active = {}                   # path -> прогресс (основной канал)
         self.active_bad = {}               # path -> прогресс (канал битых)
+        # In-memory очереди: статусы queued/downloading в БД НЕ пишем (меньше
+        # записей в SQLite). Очередь живёт в памяти; из БД подтягиваем пачками.
+        # inflight = path, что сейчас в очереди ИЛИ качаются — защита от повторной
+        # выборки того же файла из БД, пока результат (done/failed/bad) не записан.
+        self.q_main = deque()              # ожидающие path основного канала
+        self.q_bad = deque()               # ожидающие path канала битых
+        self.inflight = set()              # path в работе/очереди (оба канала)
+        self.qlock = threading.Lock()      # защищает q_main/q_bad/inflight + запись финала
         self.alock = threading.Lock()
         self.slock = threading.Lock()
         self.state_lock = threading.Lock()
-        self.claim_lock = threading.Lock()
-        self.refill_lock = threading.Lock()
         self.window = deque()              # (monotonic, bytes) для скорости
         self.session = {"done": 0, "failed": 0, "bytes": 0, "started": None}
         self.message = ""
@@ -1587,35 +1593,72 @@ class Downloader:
 
     def refill(self):
         """Держит QUEUE_SIZE готовых файлов в ОЧЕРЕДИ ОСНОВНОГО канала (queued).
-        Канал «битых» (bad) не наполняется здесь — туда файлы попадают из
-        основного, когда у них не отдался ORIGINAL."""
-        with self.refill_lock:
+        Канал «битых» (bad) наполняется отсюда же — из строк с меткой dl_status='bad'
+        (кроме отложенных backoff-ретраев: dl_at в будущем)."""
+        self._refill_one(self.q_main, ELIGIBLE, self.threads)
+        self._refill_one(self.q_bad,
+                         f"dl_status='bad' AND (dl_at IS NULL OR dl_at <= '{now_iso()}')",
+                         self.bad_threads)
+
+    def _refill_one(self, q, where, n):
+        """Подтягивает работу в in-memory очередь q, когда её длина < N. Берём 2N
+        кандидатов из БД, добавляем только те path, что ещё не в inflight (не в
+        очереди и не качаются) — так один файл не возьмётся дважды. Статус в БД
+        при постановке в очередь НЕ меняем (меньше записей; меньше гонок)."""
+        n = max(1, n)
+        with self.qlock:
+            if len(q) >= n:
+                return
+            need = 2 * n
             with dbc() as c:
-                have = c.execute(
-                    "SELECT COUNT(*) FROM items WHERE dl_status='queued' "
-                    "AND (dl_at IS NULL OR dl_at <= ?)", (now_iso(),)
-                ).fetchone()[0]
-                need = QUEUE_SIZE - have
-                if need <= 0:
-                    return
                 rows = c.execute(
-                    f"SELECT path FROM items WHERE {ELIGIBLE} {GALLERY_ORDER} LIMIT ?", (need,)
+                    f"SELECT path FROM items WHERE {where} {GALLERY_ORDER} LIMIT ?",
+                    (need + len(self.inflight),)   # с запасом: часть уже в inflight — отфильтруем
                 ).fetchall()
-                if rows:
-                    ts = now_iso()
-                    c.executemany(
-                        "UPDATE items SET dl_status='queued', dl_at=? WHERE path=?",
-                        [(ts, r[0]) for r in rows],
-                    )
+            added = 0
+            for (p,) in rows:
+                if p in self.inflight:
+                    continue
+                self.inflight.add(p)
+                q.append(p)
+                added += 1
+                if len(q) >= need:
+                    break
+
+    def _load_row(self, path):
+        with dbc() as c:
+            r = c.execute("SELECT path,name,taken,raw FROM items WHERE path=?", (path,)).fetchone()
+        return dict(r) if r else None
+
+    def _claim(self, q):
+        """Берёт path из in-memory очереди (он уже в inflight). Возвращает строку БД."""
+        with self.qlock:
+            if not q:
+                return None
+            path = q.popleft()
+        row = self._load_row(path)
+        if row is None:               # исчез из БД — снять из inflight
+            with self.qlock:
+                self.inflight.discard(path)
+            return None
+        return row
+
+    def _done_inflight(self, path):
+        """Снять path из inflight ПОСЛЕ записи результата в БД (строгий порядок:
+        сначала БД-статус done/failed/bad, потом из inflight — чтобы не возникло
+        окна «ни в inflight, ни в БД», когда refill мог бы взять его повторно)."""
+        with self.qlock:
+            self.inflight.discard(path)
 
     def _finished(self):
-        """Готово, когда НИ в одном канале нет работы: ни в очереди/работе основного
-        (queued/downloading) и битого (bad/baddl), ни новых eligible-файлов."""
+        """Готово, когда пусты обе in-memory очереди, никто не качается (inflight
+        пуст) и в БД не осталось новых кандидатов (eligible или bad)."""
+        with self.qlock:
+            if self.q_main or self.q_bad or self.inflight:
+                return False
         with dbc() as c:
             r = c.execute(
-                "SELECT COALESCE(SUM(dl_status='queued'),0), COALESCE(SUM(dl_status='downloading'),0), "
-                "COALESCE(SUM(dl_status='bad'),0), COALESCE(SUM(dl_status='baddl'),0), "
-                f"COALESCE(SUM({ELIGIBLE}),0) FROM items"
+                f"SELECT COALESCE(SUM({ELIGIBLE}),0), COALESCE(SUM(dl_status='bad'),0) FROM items"
             ).fetchone()
         return not any(r)
 
@@ -1652,42 +1695,21 @@ class Downloader:
             self.finishing.set()
             for t in list(self.workers.values()) + list(self.bad_workers.values()):
                 t.join(timeout=30)
-            with dbc() as c:
-                # Основной канал: незавершённые -> в начало (NULL -> снова eligible).
-                c.execute("UPDATE items SET dl_status=NULL WHERE dl_status IN ('queued','downloading')")
-                # Канал битых: качавшиеся -> обратно в ожидание битых (bad), не теряем пометку.
-                c.execute("UPDATE items SET dl_status='bad' WHERE dl_status='baddl'")
+            # Очереди/inflight в памяти — очищаем; статусы в БД (done/failed/bad)
+            # уже записаны, незавершённые остаются NULL/bad и переедут снова сами.
+            with self.qlock:
+                self.q_main.clear()
+                self.q_bad.clear()
+                self.inflight.clear()
 
     # ---------- воркер
 
-    def _claim_status(self, from_status, to_status):
-        """Атомарно берёт одну «дозревшую» запись в состоянии from_status и
-        переводит в to_status. dl_at отложенных ретраев должен уже наступить."""
-        with self.claim_lock:
-            with dbc() as c:
-                row = c.execute(
-                    f"SELECT path,name,taken,raw FROM items WHERE dl_status=? "
-                    f"AND (dl_at IS NULL OR dl_at <= ?) {GALLERY_ORDER} LIMIT 1",
-                    (from_status, now_iso())
-                ).fetchone()
-                if not row:
-                    return None
-                c.execute("UPDATE items SET dl_status=?, dl_at=? WHERE path=?",
-                          (to_status, now_iso(), row["path"]))
-                return dict(row)
-
-    def _claim(self):
-        return self._claim_status("queued", "downloading")
-
-    def _claim_bad(self):
-        return self._claim_status("bad", "baddl")
-
     def _worker_loop(self, idx):
-        """Основной канал: качает ТОЛЬКО ORIGINAL. Нет оригинала -> файл в 'bad'."""
+        """Основной канал: качает ТОЛЬКО ORIGINAL. Нет оригинала -> метка 'bad'."""
         while not self.stop_event.is_set() and idx < self.threads:
-            row = self._claim()
+            row = self._claim(self.q_main)
             if row is None:
-                if self.finishing.is_set():
+                if self.finishing.is_set() and not self.q_main:
                     break
                 time.sleep(0.3)
                 continue
@@ -1698,11 +1720,11 @@ class Downloader:
             self.refill()
 
     def _bad_worker_loop(self, idx):
-        """Канал битых: докачивает меньшие размеры, не занимая основной канал."""
+        """Канал битых: докачивает оригинал+меньшие размеры, не занимая основной."""
         while not self.stop_event.is_set() and idx < self.bad_threads:
-            row = self._claim_bad()
+            row = self._claim(self.q_bad)
             if row is None:
-                if self.finishing.is_set():
+                if self.finishing.is_set() and not self.q_bad:
                     break
                 time.sleep(0.5)
                 continue
@@ -1831,6 +1853,7 @@ class Downloader:
         finally:
             with self.alock:
                 self.active.pop(path, None)
+            self._done_inflight(path)   # результат в БД уже записан -> снять из inflight
 
     def _process_bad(self, row):
         """КАНАЛ БИТЫХ: вся «тяжёлая» работа и ретраи. Пробует СНАЧАЛА ORIGINAL
@@ -1891,6 +1914,7 @@ class Downloader:
         finally:
             with self.alock:
                 self.active_bad.pop(path, None)
+            self._done_inflight(path)   # результат в БД уже записан -> снять из inflight
 
     def _fetch(self, path, name, day, size, url, prog):
         day_dir = os.path.join(files_dir(), day)
@@ -1971,28 +1995,33 @@ class Downloader:
                     COALESCE(SUM(mediatype='image' AND raw IS NULL),0),
                     COALESCE(SUM(dl_status='done'),0),
                     COALESCE(SUM(dl_status='failed'),0),
-                    COALESCE(SUM(dl_status='queued'),0),
-                    COALESCE(SUM(dl_status='downloading'),0),
                     COALESCE(SUM({ELIGIBLE}),0),
                     COALESCE(SUM(CASE WHEN dl_status='done' THEN dl_bytes END),0),
-                    COALESCE(SUM(dl_status='queued' AND dl_at IS NOT NULL AND dl_at > ?),0),
                     COALESCE(SUM(dl_status='bad'),0),
-                    COALESCE(SUM(dl_status='baddl'),0),
                     COALESCE(SUM(dl_status='bad' AND dl_at IS NOT NULL AND dl_at > ?),0)
                 FROM items""",
-                (_now, _now)
+                (_now,)
             ).fetchone()
             counts = dict(zip(
-                ["images", "with_links", "no_links", "done", "failed", "queued", "downloading",
-                 "remaining", "done_bytes", "retrying", "bad_queued", "bad_downloading", "bad_retrying"],
+                ["images", "with_links", "no_links", "done", "failed",
+                 "remaining", "done_bytes", "bad_total", "bad_retrying"],
                 list(r),
             ))
             by_size = {s: n for s, n in c.execute(
                 "SELECT dl_size, COUNT(*) FROM items WHERE dl_status='done' GROUP BY dl_size")}
-            queue = [x[0] for x in c.execute(
-                f"SELECT name FROM items WHERE dl_status='queued' {GALLERY_ORDER} LIMIT ?", (QUEUE_SIZE,))]
-            queue_bad = [x[0] for x in c.execute(
-                f"SELECT name FROM items WHERE dl_status='bad' {GALLERY_ORDER} LIMIT ?", (QUEUE_SIZE,))]
+        # queued/bad_queued живут в памяти (в БД не пишем). downloading = сейчас
+        # качается (active/active_bad). Добавляем в counts.
+        with self.qlock:
+            q_main_snapshot = list(self.q_main)[:QUEUE_SIZE]
+            q_bad_snapshot = list(self.q_bad)[:QUEUE_SIZE]
+            counts["queued"] = len(self.q_main)
+            counts["bad_queued"] = len(self.q_bad)
+        with self.alock:
+            counts["downloading"] = len(self.active)
+            counts["bad_downloading"] = len(self.active_bad)
+        queue = [p.rsplit("/", 1)[-1] for p in q_main_snapshot]
+        queue_bad = [p.rsplit("/", 1)[-1] for p in q_bad_snapshot]
+        with dbc() as c:
             recent_done = [
                 {"name": x["name"], "size": x["dl_size"], "bytes": x["dl_bytes"], "file": x["dl_file"], "at": x["dl_at"]}
                 for x in c.execute(
@@ -2962,10 +2991,10 @@ STATUS_HTML = r"""<!doctype html>
       [fmtBytes(s.speed) + '/с', 'скорость'],
       [c.done, 'скачано (' + fmtBytes(c.done_bytes) + ')'],
       [c.remaining, 'ещё не в очереди'],
-      [c.queued + ' / ' + s.queue_size, 'ожидание (оригиналы)'],
-      [c.downloading + ' / ' + s.threads, 'качается (оригиналы)'],
-      [(c.bad_queued || 0) + ' / ' + (c.bad_downloading || 0), 'битые: в очереди / качается'],
-      [c.retrying || 0, 'ждут ретрая (таймауты)'],
+      [(c.queued || 0) + ' / ' + (c.downloading || 0), 'оригиналы: очередь / качается'],
+      [(c.bad_total || 0), 'битых всего'],
+      [(c.bad_queued || 0) + ' / ' + (c.bad_downloading || 0), 'битые: очередь / качается'],
+      [c.bad_retrying || 0, 'битые: ждут backoff'],
       [c.failed, 'ошибок'],
       [c.no_links, 'фото без ссылок'],
     ];
