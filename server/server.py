@@ -3213,7 +3213,7 @@ except ImportError:  # без Pillow галерея работает, но бе�
     HAVE_HEIF = False
 
 VIEW_MAX_SIDE = 4096          # длинная сторона JPEG, в который конвертируем HEIC для просмотра
-_thumb_sem = threading.Semaphore(4)   # не больше 4 одновременных сжатий
+_thumb_sem = threading.Semaphore(int(os.environ.get("YDISK_THUMB_WORKERS", "8")))  # одновременных генераций превью
 
 
 def _encode_thumb(src, dst):
@@ -3291,13 +3291,18 @@ def _done_file(rid):
 def thumb(rid):
     if not HAVE_PIL:
         return Response("Pillow не установлен: pip install pillow", status=501)
-    src = _done_file(rid)
-    if not src:
-        return Response(status=404)
 
-    key = hashlib.md5(f"{src}|{os.path.getmtime(src)}|{THUMB_SIDE}".encode("utf-8")).hexdigest()
+    # Ключ кэша — из rid и размера, БЕЗ обращения к файлу на NAS. Для уже
+    # закэшированного превью это критично: галерея запрашивает сотни миниатюр, и
+    # раньше на каждую шёл getmtime/realpath/isfile по SMB (сотни сетевых вызовов
+    # даже когда превью уже лежит локально). Теперь при наличии кэша NAS не трогаем.
+    key = hashlib.md5(f"rid{rid}|{THUMB_SIDE}".encode("utf-8")).hexdigest()
     dst = os.path.join(THUMBS_DIR, key[:2], key + ".jpg")
     if not os.path.isfile(dst):
+        # превью ещё нет — только теперь идём в БД и на NAS за оригиналом
+        src = _done_file(rid)
+        if not src:
+            return Response(status=404)
         os.makedirs(os.path.dirname(dst), exist_ok=True)
         with _thumb_sem:
             if not os.path.isfile(dst):      # вдруг другой поток уже сделал
