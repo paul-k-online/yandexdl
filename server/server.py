@@ -1829,9 +1829,9 @@ class Downloader:
         self._refill_one(self.q_main, ELIGIBLE, self.threads)
 
     def _refill_bad(self):
-        self._refill_one(self.q_bad,
-                         f"dl_status='bad' AND (dl_at IS NULL OR dl_at <= '{now_iso()}')",
-                         self.bad_threads)
+        # Без backoff: берём все 'bad' сразу и крутим по кругу, пока не скачается
+        # или не уйдёт в failed (410 / исчерпан лимит попыток).
+        self._refill_one(self.q_bad, "dl_status='bad'", self.bad_threads)
 
     def _worker_loop(self, idx):
         """Основной канал: качает ТОЛЬКО ORIGINAL. Нет оригинала -> метка 'bad'.
@@ -1918,17 +1918,16 @@ class Downloader:
         return 0
 
     def _requeue_soft(self, path, n, error, attempts, status="bad"):
-        """Временная ошибка в канале битых: не в failed, а назад в очередь битых
-        (status='bad') с задержкой (backoff). dl_at в будущем — claim возьмёт
-        запись только когда она «дозреет»."""
-        delay = min(SOFT_RETRY_CAP, SOFT_RETRY_BASE * n)
-        ready_at = now_iso_offset(delay)
+        """Временная ошибка в канале битых: не в failed, а остаётся в очереди
+        битых (status='bad') БЕЗ паузы — файл просто снова подтянется и попробуется
+        по кругу. Счётчик попыток _soft_n растёт до SOFT_RETRY_MAX, после чего
+        _process_bad отправит в failed."""
         payload = {"_soft_n": n, "last_error": (error or "")[:300], "tries": attempts}
         with dbc() as c:
             c.execute(
-                "UPDATE items SET dl_status=?, dl_error=?, dl_attempts=?, dl_at=? WHERE path=?",
-                (status, f"ретрай {n}/{SOFT_RETRY_MAX} через {delay}с: {(error or '')[:200]}",
-                 json.dumps(payload, ensure_ascii=False), ready_at, path),
+                "UPDATE items SET dl_status=?, dl_error=?, dl_attempts=?, dl_at=NULL WHERE path=?",
+                (status, f"попытка {n}/{SOFT_RETRY_MAX}: {(error or '')[:200]}",
+                 json.dumps(payload, ensure_ascii=False), path),
             )
 
     @staticmethod
@@ -2120,7 +2119,6 @@ class Downloader:
     # ---------- статус для страницы
 
     def snapshot(self):
-        _now = now_iso()
         with dbc() as c:
             r = c.execute(
                 f"""SELECT
@@ -2131,14 +2129,12 @@ class Downloader:
                     COALESCE(SUM(dl_status='failed'),0),
                     COALESCE(SUM({ELIGIBLE}),0),
                     COALESCE(SUM(CASE WHEN dl_status='done' THEN dl_bytes END),0),
-                    COALESCE(SUM(dl_status='bad'),0),
-                    COALESCE(SUM(dl_status='bad' AND dl_at IS NOT NULL AND dl_at > ?),0)
-                FROM items""",
-                (_now,)
+                    COALESCE(SUM(dl_status='bad'),0)
+                FROM items"""
             ).fetchone()
             counts = dict(zip(
                 ["images", "with_links", "no_links", "done", "failed",
-                 "remaining", "done_bytes", "bad_total", "bad_retrying"],
+                 "remaining", "done_bytes", "bad_total"],
                 list(r),
             ))
             by_size = {s: n for s, n in c.execute(
@@ -3129,7 +3125,6 @@ STATUS_HTML = r"""<!doctype html>
       [(c.queued || 0) + ' / ' + (c.downloading || 0), 'оригиналы: очередь / качается'],
       [(c.bad_total || 0), 'битых всего'],
       [(c.bad_queued || 0) + ' / ' + (c.bad_downloading || 0), 'битые: очередь / качается'],
-      [c.bad_retrying || 0, 'битые: ждут backoff'],
       [c.failed, 'ошибок'],
       [c.no_links, 'фото без ссылок'],
     ];
