@@ -164,7 +164,7 @@ ATTEMPT_DEADLINE = 180      # сек: потолок на одну попытк�
 # failed сразу, а возвращается в очередь с отложенным временем (backoff), чтобы
 # воркеры взяли его позже — за это время реплика ЦОД может ожить. Постоянные
 # ошибки (нет ссылок, html/404) по-прежнему идут в failed без ретраев.
-SOFT_RETRY_MAX = int(os.environ.get("YDISK_SOFT_RETRY_MAX", "8"))   # сколько «мягких» заходов до failed
+SOFT_RETRY_MAX = int(os.environ.get("YDISK_SOFT_RETRY_MAX", "3"))   # сколько «мягких» заходов до failed (потом в «плохие»)
 SOFT_RETRY_BASE = 30        # сек: база backoff; задержка = BASE * попытка (кап SOFT_RETRY_CAP)
 SOFT_RETRY_CAP = 600        # сек: максимальная задержка перед повторной попыткой
 USER_AGENT = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
