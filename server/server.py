@@ -149,8 +149,8 @@ def verify_saved_file(root, relative_path, expected_size=None, min_size=1):
     return candidate
 
 
-THUMB_MAX_BYTES = 30 * 1024  # целевой размер превью
-THUMB_SIDE = 360             # длинная сторона превью, px (если не влезает в 30 КБ — уменьшаем)
+THUMB_MAX_BYTES = int(os.environ.get("YDISK_THUMB_MAX_KB", "12")) * 1024  # супер-минимум на диске
+THUMB_SIDE = int(os.environ.get("YDISK_THUMB_SIDE", "200"))               # мелкое превью (хватает для скролла)
 QUEUE_SIZE = 100            # сколько файлов показываем в списке «в ожидании» (UI)
 # In-memory очередь добирается СОБЫТИЙНО (после скачанного файла / при пустой
 # очереди), не по таймеру. Чтобы не дёргать БД часто: добираем, только когда в
@@ -856,6 +856,22 @@ PAGE = """<!doctype html>
   #viewer .vclose:hover { background:#2a2a30; }
   #viewer .vcaption { position:absolute; left:0; right:0; bottom:-30px; text-align:center; color:#cfcfd6;
                        font-size:12px; word-break:break-all; }
+
+  /* --- вертикальная линейка дат (быстрый переход по годам/месяцам) --- */
+  #timeline { position:fixed; top:0; right:0; width:56px; height:100vh; z-index:50;
+              display:flex; flex-direction:column; align-items:flex-end; justify-content:space-between;
+              padding:10px 8px; user-select:none; }
+  #timeline .tl-item { font-size:11px; color:var(--mut); cursor:pointer; line-height:1.1;
+                       padding:1px 4px; border-radius:6px; white-space:nowrap; }
+  #timeline .tl-item.year { font-size:12px; color:var(--fg); font-weight:600; }
+  #timeline .tl-item:hover { background:var(--cell); color:var(--fg); }
+  #timeline .tl-item.tick { color:var(--line); font-size:9px; }
+  #tlBubble { position:fixed; right:60px; z-index:51; background:#2f6fed; color:#fff; font-weight:600;
+              font-size:12px; padding:4px 12px; border-radius:16px; white-space:nowrap; pointer-events:none;
+              opacity:0; transition:opacity .15s; box-shadow:0 2px 8px rgba(0,0,0,.4); }
+  #tlBubble.show { opacity:1; }
+  @media (max-width:640px) { #timeline { display:none; } }
+  main { padding-right:64px; }
 </style>
 </head>
 <body>
@@ -890,6 +906,9 @@ PAGE = """<!doctype html>
   <div id="sentinel"></div>
   <div id="status"></div>
 </main>
+
+<div id="timeline"></div>
+<div id="tlBubble"></div>
 
 <div id="viewer" hidden>
   <div class="vwrap">
@@ -985,6 +1004,89 @@ PAGE = """<!doctype html>
     if (entries.some(e => e.isIntersecting)) loadMore();
   }, { rootMargin: '1500px 0px' });
   if (hasMore) io.observe(sentinel); else if (list.children.length) statusEl.textContent = 'это всё';
+
+  // ---------------- вертикальная линейка дат (быстрый переход) ----------------
+  const MONTHS_SHORT = ['янв','фев','мар','апр','май','июн','июл','авг','сен','окт','ноя','дек'];
+
+  // Переход к конкретному месяцу: очищаем список и грузим галерею начиная с него.
+  // /chunk?before=<день> берёт дни строго СТАРШЕ before, поэтому передаём первый
+  // день СЛЕДУЮЩЕГО месяца, чтобы выбранный месяц попал в первую порцию.
+  async function jumpTo(ym) {
+    const [y, m] = ym.split('-').map(Number);
+    const next = m === 12 ? `${y + 1}-01-01` : `${y}-${String(m + 1).padStart(2, '0')}-01`;
+    loading = true; hasMore = true;
+    io.unobserve(sentinel);
+    list.innerHTML = '';
+    statusEl.textContent = 'загрузка…';
+    try {
+      const p = new URLSearchParams({ ...FILTERS, before: next });
+      const r = await fetch('/chunk?' + p);
+      const j = await r.json();
+      list.insertAdjacentHTML('beforeend', j.html);
+      hasMore = j.has_more;
+      cursor = j.cursor !== null ? j.cursor : next;
+      statusEl.textContent = hasMore ? '' : 'это всё';
+    } catch (e) { statusEl.textContent = 'ошибка загрузки'; }
+    loading = false;
+    window.scrollTo(0, 0);
+    if (hasMore) { io.unobserve(sentinel); io.observe(sentinel); }
+  }
+
+  async function buildTimeline() {
+    let months;
+    try {
+      const r = await fetch('/api/timeline?' + new URLSearchParams(FILTERS));
+      months = (await r.json()).months || [];
+    } catch (e) { return; }
+    if (!months.length) return;
+    const tl = document.getElementById('timeline');
+    const years = [...new Set(months.map(x => x.ym.slice(0, 4)))];   // новые -> старые
+    // показываем все годы как подписи, между ними — засечки (точки) месяцев
+    const frag = document.createDocumentFragment();
+    let lastYear = null;
+    for (const mo of months) {
+      const y = mo.ym.slice(0, 4);
+      if (y !== lastYear) {
+        lastYear = y;
+        const el = document.createElement('div');
+        el.className = 'tl-item year';
+        el.textContent = y;
+        el.title = `${mo.n} в ${MONTHS_SHORT[+mo.ym.slice(5, 7) - 1]} ${y}`;
+        el.onclick = () => jumpTo(mo.ym);
+        frag.appendChild(el);
+      } else {
+        const el = document.createElement('div');
+        el.className = 'tl-item tick';
+        el.textContent = '·';
+        el.title = `${MONTHS_SHORT[+mo.ym.slice(5, 7) - 1]} ${y} — ${mo.n}`;
+        el.onclick = () => jumpTo(mo.ym);
+        frag.appendChild(el);
+      }
+    }
+    tl.appendChild(frag);
+  }
+
+  // «пузырь» с текущим месяцем при скролле (по первой видимой секции)
+  const bubble = document.getElementById('tlBubble');
+  let bubbleTimer = null;
+  function updateBubble() {
+    const secs = list.querySelectorAll('section h2');
+    let cur = null;
+    for (const h of secs) {
+      const top = h.getBoundingClientRect().top;
+      if (top < 120) cur = h; else break;
+    }
+    if (cur) {
+      bubble.textContent = cur.firstChild.textContent.trim();
+      bubble.style.top = '12px';
+      bubble.classList.add('show');
+      clearTimeout(bubbleTimer);
+      bubbleTimer = setTimeout(() => bubble.classList.remove('show'), 900);
+    }
+  }
+  window.addEventListener('scroll', updateBubble, { passive: true });
+
+  buildTimeline();
 </script>
 </body>
 </html>
@@ -1060,6 +1162,21 @@ def render_fragment(groups):
 def chunk():
     groups, has_more, cursor = load_chunk(request.args, request.args.get("before"))
     return jsonify(html=render_fragment(groups), has_more=has_more, cursor=cursor)
+
+
+@app.get("/api/timeline")
+def api_timeline():
+    """Список год-месяц с количеством — для вертикальной линейки быстрого перехода
+    по датам (как на Яндекс.Диске). Один дешёвый GROUP BY по месяцам."""
+    sql, params = build_filters(request.args)
+    with db() as c:
+        rows = c.execute(
+            f"SELECT substr(taken,1,7) AS ym, COUNT(*) AS n FROM items{sql} "
+            "WHERE taken IS NOT NULL AND taken<>'' GROUP BY ym ORDER BY ym DESC",
+            params,
+        ).fetchall()
+    months = [{"ym": r["ym"], "n": r["n"]} for r in rows if r["ym"]]
+    return jsonify(months=months)
 
 
 @app.get("/")
