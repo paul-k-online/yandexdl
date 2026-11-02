@@ -151,7 +151,14 @@ def verify_saved_file(root, relative_path, expected_size=None, min_size=1):
 
 THUMB_MAX_BYTES = 30 * 1024  # целевой размер превью
 THUMB_SIDE = 360             # длинная сторона превью, px (если не влезает в 30 КБ — уменьшаем)
-QUEUE_SIZE = 100            # сколько файлов всегда ждут в очереди (на каждый канал)
+QUEUE_SIZE = 100            # сколько файлов показываем в списке «в ожидании» (UI)
+# In-memory очередь добирается СОБЫТИЙНО (после скачанного файла / при пустой
+# очереди), не по таймеру. Чтобы не дёргать БД часто: добираем, только когда в
+# очереди осталось меньше QUEUE_LOW_FACTOR*N, и берём большой пачкой
+# QUEUE_BATCH_FACTOR*N (но не меньше QUEUE_BATCH_MIN) — один крупный SELECT редко.
+QUEUE_LOW_FACTOR = 1        # добирать, когда очередь < N
+QUEUE_BATCH_FACTOR = 10     # брать 10*N за раз
+QUEUE_BATCH_MIN = 50
 DEFAULT_THREADS = 8         # потоки основного канала (оригиналы) по умолчанию
 DEFAULT_BAD_THREADS = 8     # потоки канала «битых» (докачка превью) по умолчанию
 DEFAULT_ORIGINAL_TRIES = 2  # попыток скачать ORIGINAL в основном канале до переноса в «битые»
@@ -1591,57 +1598,40 @@ class Downloader:
 
     # ---------- менеджер
 
-    def refill(self):
-        """Держит QUEUE_SIZE готовых файлов в ОЧЕРЕДИ ОСНОВНОГО канала (queued).
-        Канал «битых» (bad) наполняется отсюда же — из строк с меткой dl_status='bad'
-        (кроме отложенных backoff-ретраев: dl_at в будущем)."""
-        self._refill_one(self.q_main, ELIGIBLE, self.threads)
-        self._refill_one(self.q_bad,
-                         f"dl_status='bad' AND (dl_at IS NULL OR dl_at <= '{now_iso()}')",
-                         self.bad_threads)
-
     def _refill_one(self, q, where, n):
-        """Подтягивает работу в in-memory очередь q, когда её длина < N. Берём 2N
-        кандидатов из БД, добавляем только те path, что ещё не в inflight (не в
-        очереди и не качаются) — так один файл не возьмётся дважды. Статус в БД
-        при постановке в очередь НЕ меняем (меньше записей; меньше гонок)."""
+        """Добирает in-memory очередь q. РАННИЙ ВЫХОД без SELECT, если очередь ещё
+        >= порога — обычный случай, БД не трогаем вовсе. Иначе один БОЛЬШОЙ SELECT
+        (батч), кладём в очередь ГОТОВЫЕ строки (path+name+taken+raw) — так claim
+        не делает отдельный SELECT на каждый файл. В inflight только те, что ещё не
+        в работе, — один файл не возьмётся дважды."""
         n = max(1, n)
+        low = QUEUE_LOW_FACTOR * n
         with self.qlock:
-            if len(q) >= n:
-                return
-            need = 2 * n
-            with dbc() as c:
-                rows = c.execute(
-                    f"SELECT path FROM items WHERE {where} {GALLERY_ORDER} LIMIT ?",
-                    (need + len(self.inflight),)   # с запасом: часть уже в inflight — отфильтруем
-                ).fetchall()
-            added = 0
-            for (p,) in rows:
+            if len(q) >= low:
+                return            # очередь норм — мгновенный скип, без обращения к БД
+            batch = max(QUEUE_BATCH_MIN, QUEUE_BATCH_FACTOR * n)
+            limit = batch + len(self.inflight)   # запас: часть кандидатов уже в inflight
+        with dbc() as c:
+            rows = c.execute(
+                f"SELECT path,name,taken,raw FROM items WHERE {where} {GALLERY_ORDER} LIMIT ?",
+                (limit,)
+            ).fetchall()
+        with self.qlock:
+            for r in rows:
+                p = r["path"]
                 if p in self.inflight:
                     continue
                 self.inflight.add(p)
-                q.append(p)
-                added += 1
-                if len(q) >= need:
+                q.append(dict(r))
+                if len(q) >= batch:
                     break
 
-    def _load_row(self, path):
-        with dbc() as c:
-            r = c.execute("SELECT path,name,taken,raw FROM items WHERE path=?", (path,)).fetchone()
-        return dict(r) if r else None
-
     def _claim(self, q):
-        """Берёт path из in-memory очереди (он уже в inflight). Возвращает строку БД."""
+        """Берёт готовую строку из in-memory очереди (path уже в inflight). Без SELECT."""
         with self.qlock:
             if not q:
                 return None
-            path = q.popleft()
-        row = self._load_row(path)
-        if row is None:               # исчез из БД — снять из inflight
-            with self.qlock:
-                self.inflight.discard(path)
-            return None
-        return row
+            return q.popleft()
 
     def _done_inflight(self, path):
         """Снять path из inflight ПОСЛЕ записи результата в БД (строгий порядок:
@@ -1681,8 +1671,7 @@ class Downloader:
         try:
             while not self.stop_event.is_set():
                 self._ensure_workers()
-                self.refill()
-                if self._finished():
+                if self._finished():      # добор очередей — событийный, в воркерах
                     natural = True
                     break
                 time.sleep(0.5)
@@ -1704,9 +1693,20 @@ class Downloader:
 
     # ---------- воркер
 
+    def _refill_main(self):
+        self._refill_one(self.q_main, ELIGIBLE, self.threads)
+
+    def _refill_bad(self):
+        self._refill_one(self.q_bad,
+                         f"dl_status='bad' AND (dl_at IS NULL OR dl_at <= '{now_iso()}')",
+                         self.bad_threads)
+
     def _worker_loop(self, idx):
-        """Основной канал: качает ТОЛЬКО ORIGINAL. Нет оригинала -> метка 'bad'."""
+        """Основной канал: качает ТОЛЬКО ORIGINAL. Нет оригинала -> метка 'bad'.
+        Добор очереди — событийный: пробуем до claim (если очередь просела) и после
+        каждого файла. _refill_main мгновенно скипает, если очередь ещё полная."""
         while not self.stop_event.is_set() and idx < self.threads:
+            self._refill_main()
             row = self._claim(self.q_main)
             if row is None:
                 if self.finishing.is_set() and not self.q_main:
@@ -1717,11 +1717,12 @@ class Downloader:
                 self._process_main(row)
             except Exception as e:  # noqa: BLE001
                 self._record_fail(row["path"], f"внутренняя ошибка: {e}", [])
-            self.refill()
+            self._refill_main()
 
     def _bad_worker_loop(self, idx):
         """Канал битых: докачивает оригинал+меньшие размеры, не занимая основной."""
         while not self.stop_event.is_set() and idx < self.bad_threads:
+            self._refill_bad()
             row = self._claim(self.q_bad)
             if row is None:
                 if self.finishing.is_set() and not self.q_bad:
@@ -1732,6 +1733,7 @@ class Downloader:
                 self._process_bad(row)
             except Exception as e:  # noqa: BLE001
                 self._record_fail(row["path"], f"внутренняя ошибка: {e}", [])
+            self._refill_bad()
 
     def _set_item(self, path, status, size=None, file=None, nbytes=None, error=None, attempts=None):
         # Корень НЕ храним (dl_root=NULL): путь dl_file относительный от текущей
@@ -2019,8 +2021,9 @@ class Downloader:
         with self.alock:
             counts["downloading"] = len(self.active)
             counts["bad_downloading"] = len(self.active_bad)
-        queue = [p.rsplit("/", 1)[-1] for p in q_main_snapshot]
-        queue_bad = [p.rsplit("/", 1)[-1] for p in q_bad_snapshot]
+        # элементы очереди — готовые строки (dict); показываем name
+        queue = [r.get("name") or r["path"].rsplit("/", 1)[-1] for r in q_main_snapshot]
+        queue_bad = [r.get("name") or r["path"].rsplit("/", 1)[-1] for r in q_bad_snapshot]
         with dbc() as c:
             recent_done = [
                 {"name": x["name"], "size": x["dl_size"], "bytes": x["dl_bytes"], "file": x["dl_file"], "at": x["dl_at"]}
