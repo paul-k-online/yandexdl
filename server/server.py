@@ -151,8 +151,10 @@ def verify_saved_file(root, relative_path, expected_size=None, min_size=1):
 
 THUMB_MAX_BYTES = 30 * 1024  # целевой размер превью
 THUMB_SIDE = 360             # длинная сторона превью, px (если не влезает в 30 КБ — уменьшаем)
-QUEUE_SIZE = 100            # сколько файлов всегда ждут в очереди
-DEFAULT_THREADS = 8
+QUEUE_SIZE = 100            # сколько файлов всегда ждут в очереди (на каждый канал)
+DEFAULT_THREADS = 8         # потоки основного канала (оригиналы) по умолчанию
+DEFAULT_BAD_THREADS = 8     # потоки канала «битых» (докачка превью) по умолчанию
+DEFAULT_ORIGINAL_TRIES = 2  # попыток скачать ORIGINAL в основном канале до переноса в «битые»
 MAX_THREADS = 32
 # порядок попыток: сначала оригинал, потом превью от большего к меньшему
 SIZE_ORDER = ["ORIGINAL", "XXXL", "XXL", "XL", "L", "M", "S", "XS", "XXS", "XXXS", "DEFAULT"]
@@ -295,6 +297,8 @@ def init_db():
         c.execute("CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT)")
         # после перезапуска «зависшие» элементы очереди возвращаем в исходное состояние
         c.execute("UPDATE items SET dl_status=NULL WHERE dl_status IN ('queued','downloading')")
+        # качавшиеся в канале битых -> обратно в очередь битых (пометку не теряем)
+        c.execute("UPDATE items SET dl_status='bad' WHERE dl_status='baddl'")
         c.execute("UPDATE items SET vd_status=NULL WHERE vd_status IN ('queued','downloading')")
 
 
@@ -1469,13 +1473,17 @@ GALLERY_ORDER = "ORDER BY COALESCE(taken,'') DESC, name DESC"   # как в га
 
 class Downloader:
     def __init__(self):
-        self.threads = DEFAULT_THREADS
+        self.threads = DEFAULT_THREADS            # основной канал (оригиналы)
+        self.bad_threads = DEFAULT_BAD_THREADS    # канал «битых» (докачка превью)
+        self.original_tries = DEFAULT_ORIGINAL_TRIES
         self.stop_event = threading.Event()
         self.stop_event.set()              # изначально «не запущено»
         self.finishing = threading.Event()  # менеджер закончил: воркеры выходят, когда очередь пуста
         self.manager = None
-        self.workers = {}
-        self.active = {}                   # path -> прогресс текущей загрузки
+        self.workers = {}                  # основной пул: idx -> Thread
+        self.bad_workers = {}              # пул битых: idx -> Thread
+        self.active = {}                   # path -> прогресс (основной канал)
+        self.active_bad = {}               # path -> прогресс (канал битых)
         self.alock = threading.Lock()
         self.slock = threading.Lock()
         self.state_lock = threading.Lock()
@@ -1489,18 +1497,34 @@ class Downloader:
     # ---------- управление
 
     def load_settings(self):
-        try:
-            self.threads = max(1, min(MAX_THREADS, int(get_setting("threads", DEFAULT_THREADS))))
-        except (TypeError, ValueError):
-            self.threads = DEFAULT_THREADS
+        def _int(key, default, lo, hi):
+            try:
+                return max(lo, min(hi, int(get_setting(key, default))))
+            except (TypeError, ValueError):
+                return default
+        self.threads = _int("threads", DEFAULT_THREADS, 1, MAX_THREADS)
+        self.bad_threads = _int("bad_threads", DEFAULT_BAD_THREADS, 1, MAX_THREADS)
+        self.original_tries = _int("original_tries", DEFAULT_ORIGINAL_TRIES, 1, 10)
 
     def set_threads(self, n):
         self.threads = max(1, min(MAX_THREADS, int(n)))
         set_setting("threads", self.threads)
         return self.threads
 
+    def set_bad_threads(self, n):
+        self.bad_threads = max(1, min(MAX_THREADS, int(n)))
+        set_setting("bad_threads", self.bad_threads)
+        return self.bad_threads
+
+    def set_original_tries(self, n):
+        self.original_tries = max(1, min(10, int(n)))
+        set_setting("original_tries", self.original_tries)
+        return self.original_tries
+
     def _alive(self):
-        return bool(self.manager and self.manager.is_alive()) or any(t.is_alive() for t in self.workers.values())
+        return (bool(self.manager and self.manager.is_alive())
+                or any(t.is_alive() for t in self.workers.values())
+                or any(t.is_alive() for t in self.bad_workers.values()))
 
     def state(self):
         if not self._alive():
@@ -1515,8 +1539,10 @@ class Downloader:
             self.finishing.clear()
             self.message = ""
             self.workers = {}
+            self.bad_workers = {}
             with self.alock:
                 self.active = {}
+                self.active_bad = {}
             self.session = {"done": 0, "failed": 0, "bytes": 0, "started": time.time()}
             self.manager = threading.Thread(target=self._manager_loop, name="dl-manager", daemon=True)
             self.manager.start()
@@ -1537,9 +1563,9 @@ class Downloader:
     # ---------- менеджер
 
     def refill(self):
-        """Держит в очереди ровно QUEUE_SIZE готовых к работе файлов (самые верхние
-        в галерее — первыми). Отложенные ретраи (dl_at в будущем) не считаются
-        занятыми слотами — иначе backoff-записи заблокировали бы добор новой работы."""
+        """Держит QUEUE_SIZE готовых файлов в ОЧЕРЕДИ ОСНОВНОГО канала (queued).
+        Канал «битых» (bad) не наполняется здесь — туда файлы попадают из
+        основного, когда у них не отдался ORIGINAL."""
         with self.refill_lock:
             with dbc() as c:
                 have = c.execute(
@@ -1560,9 +1586,12 @@ class Downloader:
                     )
 
     def _finished(self):
+        """Готово, когда НИ в одном канале нет работы: ни в очереди/работе основного
+        (queued/downloading) и битого (bad/baddl), ни новых eligible-файлов."""
         with dbc() as c:
             r = c.execute(
                 "SELECT COALESCE(SUM(dl_status='queued'),0), COALESCE(SUM(dl_status='downloading'),0), "
+                "COALESCE(SUM(dl_status='bad'),0), COALESCE(SUM(dl_status='baddl'),0), "
                 f"COALESCE(SUM({ELIGIBLE}),0) FROM items"
             ).fetchone()
         return not any(r)
@@ -1573,6 +1602,12 @@ class Downloader:
             if t is None or not t.is_alive():
                 t = threading.Thread(target=self._worker_loop, args=(idx,), name=f"dl-{idx}", daemon=True)
                 self.workers[idx] = t
+                t.start()
+        for idx in range(self.bad_threads):
+            t = self.bad_workers.get(idx)
+            if t is None or not t.is_alive():
+                t = threading.Thread(target=self._bad_worker_loop, args=(idx,), name=f"dl-bad-{idx}", daemon=True)
+                self.bad_workers[idx] = t
                 t.start()
 
     def _manager_loop(self):
@@ -1592,29 +1627,40 @@ class Downloader:
             if natural and not self.message:
                 self.message = "Готово: очередь пуста."
             self.finishing.set()
-            for t in list(self.workers.values()):
+            for t in list(self.workers.values()) + list(self.bad_workers.values()):
                 t.join(timeout=30)
             with dbc() as c:
+                # Основной канал: незавершённые -> в начало (NULL -> снова eligible).
                 c.execute("UPDATE items SET dl_status=NULL WHERE dl_status IN ('queued','downloading')")
+                # Канал битых: качавшиеся -> обратно в ожидание битых (bad), не теряем пометку.
+                c.execute("UPDATE items SET dl_status='bad' WHERE dl_status='baddl'")
 
     # ---------- воркер
 
-    def _claim(self):
+    def _claim_status(self, from_status, to_status):
+        """Атомарно берёт одну «дозревшую» запись в состоянии from_status и
+        переводит в to_status. dl_at отложенных ретраев должен уже наступить."""
         with self.claim_lock:
             with dbc() as c:
-                # dl_at у отложенных ретраев хранит время готовности (в будущем).
-                # Берём только «дозревшие»: dl_at пуст или уже наступил.
                 row = c.execute(
-                    f"SELECT path,name,taken,raw FROM items WHERE dl_status='queued' "
+                    f"SELECT path,name,taken,raw FROM items WHERE dl_status=? "
                     f"AND (dl_at IS NULL OR dl_at <= ?) {GALLERY_ORDER} LIMIT 1",
-                    (now_iso(),)
+                    (from_status, now_iso())
                 ).fetchone()
                 if not row:
                     return None
-                c.execute("UPDATE items SET dl_status='downloading', dl_at=? WHERE path=?", (now_iso(), row["path"]))
+                c.execute("UPDATE items SET dl_status=?, dl_at=? WHERE path=?",
+                          (to_status, now_iso(), row["path"]))
                 return dict(row)
 
+    def _claim(self):
+        return self._claim_status("queued", "downloading")
+
+    def _claim_bad(self):
+        return self._claim_status("bad", "baddl")
+
     def _worker_loop(self, idx):
+        """Основной канал: качает ТОЛЬКО ORIGINAL. Нет оригинала -> файл в 'bad'."""
         while not self.stop_event.is_set() and idx < self.threads:
             row = self._claim()
             if row is None:
@@ -1623,10 +1669,24 @@ class Downloader:
                 time.sleep(0.3)
                 continue
             try:
-                self._process(row)
+                self._process_main(row)
             except Exception as e:  # noqa: BLE001
                 self._record_fail(row["path"], f"внутренняя ошибка: {e}", [])
             self.refill()
+
+    def _bad_worker_loop(self, idx):
+        """Канал битых: докачивает меньшие размеры, не занимая основной канал."""
+        while not self.stop_event.is_set() and idx < self.bad_threads:
+            row = self._claim_bad()
+            if row is None:
+                if self.finishing.is_set():
+                    break
+                time.sleep(0.5)
+                continue
+            try:
+                self._process_bad(row)
+            except Exception as e:  # noqa: BLE001
+                self._record_fail(row["path"], f"внутренняя ошибка: {e}", [])
 
     def _set_item(self, path, status, size=None, file=None, nbytes=None, error=None, attempts=None):
         # Корень НЕ храним (dl_root=NULL): путь dl_file относительный от текущей
@@ -1655,6 +1715,15 @@ class Downloader:
         self._set_item(path, "failed", error=error, attempts=attempts)
         self._on_result(False)
 
+    def _mark_bad(self, path, error):
+        """Основной канал не смог взять ORIGINAL -> переносим в очередь битых.
+        Там отдельный пул докачает меньший размер, не занимая основной канал."""
+        with dbc() as c:
+            c.execute(
+                "UPDATE items SET dl_status='bad', dl_error=?, dl_at=NULL WHERE path=?",
+                ((error or "ORIGINAL недоступен")[:300], path),
+            )
+
     def _soft_attempts(self, path):
         """Сколько «мягких» заходов уже было у файла (хранится в dl_attempts как _soft_n)."""
         with dbc() as c:
@@ -1669,36 +1738,90 @@ class Downloader:
             pass
         return 0
 
-    def _requeue_soft(self, path, n, error, attempts):
-        """Временная ошибка: не в failed, а назад в очередь с задержкой (backoff).
-        dl_at ставим в будущее — _claim берёт только «дозревшие» записи."""
+    def _requeue_soft(self, path, n, error, attempts, status="bad"):
+        """Временная ошибка в канале битых: не в failed, а назад в очередь битых
+        (status='bad') с задержкой (backoff). dl_at в будущем — claim возьмёт
+        запись только когда она «дозреет»."""
         delay = min(SOFT_RETRY_CAP, SOFT_RETRY_BASE * n)
         ready_at = now_iso_offset(delay)
         payload = {"_soft_n": n, "last_error": (error or "")[:300], "tries": attempts}
         with dbc() as c:
             c.execute(
-                "UPDATE items SET dl_status='queued', dl_error=?, dl_attempts=?, dl_at=? WHERE path=?",
-                (f"ретрай {n}/{SOFT_RETRY_MAX} через {delay}с: {(error or '')[:200]}",
+                "UPDATE items SET dl_status=?, dl_error=?, dl_attempts=?, dl_at=? WHERE path=?",
+                (status, f"ретрай {n}/{SOFT_RETRY_MAX} через {delay}с: {(error or '')[:200]}",
                  json.dumps(payload, ensure_ascii=False), ready_at, path),
             )
 
-    def _process(self, row):
-        path, name = row["path"], row["name"]
-        day = (row["taken"] or "")[:10] or "no-date"
+    @staticmethod
+    def _sizes_of(row):
         try:
             meta = (json.loads(row["raw"] or "{}").get("meta")) or {}
-            sizes = {s["name"]: s["url"] for s in (meta.get("sizes") or []) if s.get("name") and s.get("url")}
+            return {s["name"]: s["url"] for s in (meta.get("sizes") or []) if s.get("name") and s.get("url")}
         except Exception:  # noqa: BLE001
-            sizes = {}
-        order = [s for s in SIZE_ORDER if s in sizes]
+            return {}
+
+    def _process_main(self, row):
+        """ОСНОВНОЙ канал: качает только ORIGINAL (до self.original_tries попыток).
+        Успех -> done. Оригинал не отдался (временная ошибка) -> переносим файл в
+        очередь битых (bad), НЕ занимая основной поток перебором превью."""
+        path, name = row["path"], row["name"]
+        day = (row["taken"] or "")[:10] or "no-date"
+        sizes = self._sizes_of(row)
+        url = sizes.get("ORIGINAL")
+        if not url:
+            # Оригинала в ссылках нет вовсе — сразу в битые (там докачают превью).
+            if sizes:
+                self._mark_bad(path, "нет ссылки на ORIGINAL")
+            else:
+                self._record_fail(path, "нет ссылок на скачивание", [])
+            return
+        if url.startswith("//"):
+            url = "https:" + url
+
+        prog = {"name": name, "size": "ORIGINAL", "bytes": 0, "total": None,
+                "attempt": 1, "of": self.original_tries, "since": time.time()}
+        with self.alock:
+            self.active[path] = prog
+        attempts = []
+        try:
+            for i in range(1, self.original_tries + 1):
+                if self.stop_event.is_set():
+                    raise Aborted()
+                prog.update(bytes=0, total=None, attempt=i)
+                try:
+                    rel, nbytes = self._fetch(path, name, day, "ORIGINAL", url, prog)
+                except Aborted:
+                    raise
+                except Exception as e:  # noqa: BLE001
+                    attempts.append(f"ORIGINAL#{i}: {short_err(e)}")
+                    continue
+                self._set_item(path, "done", size="ORIGINAL", file=rel, nbytes=nbytes, attempts=attempts)
+                self._on_result(True, nbytes)
+                return
+            # ORIGINAL так и не дался -> в очередь битых (докачать меньший размер).
+            self._mark_bad(path, "; ".join(attempts))
+        except Aborted:
+            self._set_item(path, None)
+        finally:
+            with self.alock:
+                self.active.pop(path, None)
+
+    def _process_bad(self, row):
+        """КАНАЛ БИТЫХ: оригинала нет, докачиваем меньший размер (XXXL -> ... ->
+        DEFAULT), чтобы было хоть что-то. Временная ошибка -> soft-retry в очередь
+        битых с backoff; исчерпали -> failed."""
+        path, name = row["path"], row["name"]
+        day = (row["taken"] or "")[:10] or "no-date"
+        sizes = self._sizes_of(row)
+        order = [s for s in SIZE_ORDER if s != "ORIGINAL" and s in sizes]
         if not order:
-            self._record_fail(path, "нет ссылок на скачивание", [])
+            self._record_fail(path, "нет превью-ссылок (только ORIGINAL)", [])
             return
 
         prog = {"name": name, "size": order[0], "bytes": 0, "total": None,
                 "attempt": 1, "of": len(order), "since": time.time()}
         with self.alock:
-            self.active[path] = prog
+            self.active_bad[path] = prog
         attempts = []
         had_transient = False
         try:
@@ -1721,19 +1844,17 @@ class Downloader:
                 self._set_item(path, "done", size=size, file=rel, nbytes=nbytes, attempts=attempts)
                 self._on_result(True, nbytes)
                 return
-            # Все размеры не удались. Если причина временная (таймаут/5xx/обрыв) и
-            # лимит мягких ретраев не исчерпан — назад в очередь с задержкой, а не в failed.
             if had_transient:
                 n = self._soft_attempts(path) + 1
                 if n <= SOFT_RETRY_MAX:
-                    self._requeue_soft(path, n, "; ".join(attempts), attempts)
+                    self._requeue_soft(path, n, "; ".join(attempts), attempts, status="bad")
                     return
             self._record_fail(path, "; ".join(attempts), attempts)
         except Aborted:
-            self._set_item(path, None)
+            self._set_item(path, "bad")   # остановка пользователем — вернуть в очередь битых
         finally:
             with self.alock:
-                self.active.pop(path, None)
+                self.active_bad.pop(path, None)
 
     def _fetch(self, path, name, day, size, url, prog):
         day_dir = os.path.join(files_dir(), day)
@@ -1818,19 +1939,24 @@ class Downloader:
                     COALESCE(SUM(dl_status='downloading'),0),
                     COALESCE(SUM({ELIGIBLE}),0),
                     COALESCE(SUM(CASE WHEN dl_status='done' THEN dl_bytes END),0),
-                    COALESCE(SUM(dl_status='queued' AND dl_at IS NOT NULL AND dl_at > ?),0)
+                    COALESCE(SUM(dl_status='queued' AND dl_at IS NOT NULL AND dl_at > ?),0),
+                    COALESCE(SUM(dl_status='bad'),0),
+                    COALESCE(SUM(dl_status='baddl'),0),
+                    COALESCE(SUM(dl_status='bad' AND dl_at IS NOT NULL AND dl_at > ?),0)
                 FROM items""",
-                (_now,)
+                (_now, _now)
             ).fetchone()
             counts = dict(zip(
                 ["images", "with_links", "no_links", "done", "failed", "queued", "downloading",
-                 "remaining", "done_bytes", "retrying"],
+                 "remaining", "done_bytes", "retrying", "bad_queued", "bad_downloading", "bad_retrying"],
                 list(r),
             ))
             by_size = {s: n for s, n in c.execute(
                 "SELECT dl_size, COUNT(*) FROM items WHERE dl_status='done' GROUP BY dl_size")}
             queue = [x[0] for x in c.execute(
                 f"SELECT name FROM items WHERE dl_status='queued' {GALLERY_ORDER} LIMIT ?", (QUEUE_SIZE,))]
+            queue_bad = [x[0] for x in c.execute(
+                f"SELECT name FROM items WHERE dl_status='bad' {GALLERY_ORDER} LIMIT ?", (QUEUE_SIZE,))]
             recent_done = [
                 {"name": x["name"], "size": x["dl_size"], "bytes": x["dl_bytes"], "file": x["dl_file"], "at": x["dl_at"]}
                 for x in c.execute(
@@ -1859,11 +1985,15 @@ class Downloader:
         with self.alock:
             active = sorted(self.active.values(), key=lambda p: p["since"])
             active = [dict(p, elapsed=round(time.time() - p["since"], 1)) for p in active]
+            active_bad = sorted(self.active_bad.values(), key=lambda p: p["since"])
+            active_bad = [dict(p, elapsed=round(time.time() - p["since"], 1)) for p in active_bad]
 
         return {
             "state": self.state(),
             "message": self.message,
             "threads": self.threads,
+            "bad_threads": self.bad_threads,
+            "original_tries": self.original_tries,
             "queue_size": QUEUE_SIZE,
             "files_dir": os.path.abspath(files_dir()),
             "speed": speed,
@@ -1871,7 +2001,9 @@ class Downloader:
             "counts": counts,
             "by_size": by_size,
             "active": active,
+            "active_bad": active_bad,
             "queue": queue,
+            "queue_bad": queue_bad,
             "recent_done": recent_done,
             "recent_failed": recent_failed,
         }
@@ -2511,11 +2643,17 @@ def api_dl_stop():
 @app.post("/api/dl/threads")
 def api_dl_threads():
     body = request.get_json(silent=True) or {}
+    out = {"ok": True}
     try:
-        n = DL.set_threads(int(body.get("threads")))
+        if body.get("threads") is not None:
+            out["threads"] = DL.set_threads(int(body["threads"]))
+        if body.get("bad_threads") is not None:
+            out["bad_threads"] = DL.set_bad_threads(int(body["bad_threads"]))
+        if body.get("original_tries") is not None:
+            out["original_tries"] = DL.set_original_tries(int(body["original_tries"]))
     except (TypeError, ValueError):
-        return jsonify(ok=False, error="threads должен быть числом"), 400
-    return jsonify(ok=True, threads=n)
+        return jsonify(ok=False, error="значения должны быть числами"), 400
+    return jsonify(out)
 
 
 @app.post("/api/dl/retry-failed")
@@ -2628,8 +2766,12 @@ STATUS_HTML = r"""<!doctype html>
     <span id="state" class="pill">…</span>
     <button id="btnStart" class="primary">Скачать только фото</button>
     <button id="btnStop">Остановить</button>
-    <span class="mut">потоков:</span>
+    <span class="mut">потоков (оригиналы):</span>
     <input id="threads" type="number" min="1" max="32" value="8">
+    <span class="mut">потоков (битые):</span>
+    <input id="badThreads" type="number" min="1" max="32" value="8">
+    <span class="mut">попыток ORIGINAL:</span>
+    <input id="origTries" type="number" min="1" max="10" value="2">
     <button id="btnThreads">Применить</button>
     <button id="btnRetry">Повторить ошибки</button>
   </div>
@@ -2647,13 +2789,20 @@ STATUS_HTML = r"""<!doctype html>
   <div class="mut" id="barText" style="margin-top:4px"></div>
   <div id="bysize" style="margin-top:10px"></div>
 
-  <h3>Качается сейчас <small id="activeCount"></small></h3>
+  <h3>Качается: оригиналы <small id="activeCount"></small></h3>
   <table id="active"></table>
+
+  <h3>Качается: битые (докачка превью) <small id="activeBadCount"></small></h3>
+  <table id="activeBad"></table>
 
   <div class="cols">
     <div>
-      <h3>В ожидании <small id="queueCount"></small></h3>
+      <h3>В ожидании (оригиналы) <small id="queueCount"></small></h3>
       <div class="box mono" id="queue"></div>
+    </div>
+    <div>
+      <h3>В ожидании (битые) <small id="queueBadCount"></small></h3>
+      <div class="box mono" id="queueBad"></div>
     </div>
     <div>
       <h3>Недавно скачано</h3>
@@ -2766,6 +2915,8 @@ STATUS_HTML = r"""<!doctype html>
     $('btnRetry').disabled = c.failed === 0 || s.state !== 'idle';
     $('btnRetry').textContent = 'Повторить ошибки' + (c.failed ? ` (${c.failed})` : '');
     if (document.activeElement !== $('threads')) $('threads').value = s.threads;
+    if (document.activeElement !== $('badThreads')) $('badThreads').value = s.bad_threads;
+    if (document.activeElement !== $('origTries')) $('origTries').value = s.original_tries;
     $('dir').textContent = 'Папка: ' + s.files_dir + '/<дата>/';
     if (document.activeElement !== $('dirInput')) $('dirInput').value = s.files_dir;
     $('btnDirApply').disabled = s.state !== 'idle';
@@ -2775,8 +2926,9 @@ STATUS_HTML = r"""<!doctype html>
       [fmtBytes(s.speed) + '/с', 'скорость'],
       [c.done, 'скачано (' + fmtBytes(c.done_bytes) + ')'],
       [c.remaining, 'ещё не в очереди'],
-      [c.queued + ' / ' + s.queue_size, 'в ожидании'],
-      [c.downloading + ' / ' + s.threads, 'качается'],
+      [c.queued + ' / ' + s.queue_size, 'ожидание (оригиналы)'],
+      [c.downloading + ' / ' + s.threads, 'качается (оригиналы)'],
+      [(c.bad_queued || 0) + ' / ' + (c.bad_downloading || 0), 'битые: в очереди / качается'],
       [c.retrying || 0, 'ждут ретрая (таймауты)'],
       [c.failed, 'ошибок'],
       [c.no_links, 'фото без ссылок'],
@@ -2790,16 +2942,23 @@ STATUS_HTML = r"""<!doctype html>
     const chips = SIZES.filter(k => s.by_size[k]).map(k => el('span', 'chip ' + k, `${k} ${s.by_size[k]}`));
     $('bysize').replaceChildren(...chips);
 
-    $('activeCount').textContent = s.active.length ? `(${s.active.length})` : '';
-    $('active').replaceChildren(...s.active.map(p => {
+    const activeRow = (p) => {
       const pct = p.total ? Math.min(100, 100 * p.bytes / p.total) : 0;
       const bar = el('div', 'bar'); const i = el('i'); i.style.width = pct + '%'; bar.appendChild(i);
       return row(el('span', 'mono', p.name), el('span', 'chip ' + p.size, p.size), `${p.attempt}/${p.of}`,
                  bar, fmtBytes(p.bytes) + (p.total ? ' / ' + fmtBytes(p.total) : ''), p.elapsed + ' с');
-    }));
+    };
+    $('activeCount').textContent = s.active.length ? `(${s.active.length})` : '';
+    $('active').replaceChildren(...s.active.map(activeRow));
+    const ab = s.active_bad || [];
+    $('activeBadCount').textContent = ab.length ? `(${ab.length})` : '';
+    $('activeBad').replaceChildren(...ab.map(activeRow));
 
     $('queueCount').textContent = `(${s.queue.length} из ${s.queue_size})`;
     $('queue').replaceChildren(...s.queue.map(n => el('div', null, n)));
+    const qb = s.queue_bad || [];
+    $('queueBadCount').textContent = `(${qb.length})`;
+    $('queueBad').replaceChildren(...qb.map(n => el('div', null, n)));
 
     $('done').replaceChildren(...s.recent_done.map(d => row(el('span', 'mono', d.name), el('span', 'chip ' + d.size, d.size), fmtBytes(d.bytes), fmtTime(d.at))));
     $('failCount').textContent = c.failed ? `(${c.failed})` : '';
@@ -2932,7 +3091,15 @@ STATUS_HTML = r"""<!doctype html>
   }
   $('btnStart').onclick = async () => { const r = await api('/api/dl/start', {}); if (r.error) alert(r.error); refresh(); };
   $('btnStop').onclick = async () => { await api('/api/dl/stop', {}); refresh(); };
-  $('btnThreads').onclick = async () => { await api('/api/dl/threads', { threads: parseInt($('threads').value, 10) }); $('threads').blur(); refresh(); };
+  $('btnThreads').onclick = async () => {
+    await api('/api/dl/threads', {
+      threads: parseInt($('threads').value, 10),
+      bad_threads: parseInt($('badThreads').value, 10),
+      original_tries: parseInt($('origTries').value, 10),
+    });
+    $('threads').blur(); $('badThreads').blur(); $('origTries').blur();
+    refresh();
+  };
   $('btnRetry').onclick = async () => { await api('/api/dl/retry-failed', {}); refresh(); };
   $('btnDirApply').onclick = async () => {
     $('dirMsg').textContent = 'проверяю...';
