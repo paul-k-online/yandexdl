@@ -33,7 +33,11 @@ from urllib.parse import parse_qs, urlparse
 
 import websocket  # pip install websocket-client
 
-SERVER_URL = os.environ.get("YDISK_SERVER_URL", "http://127.0.0.1:8001/api/ingest")
+# Порт берём из YDISK_PORT (тот же, что слушает server.py) — иначе при запуске
+# нескольких профилей (olya=8002) capture слал бы на дефолтный 8001 и ловил
+# 10061 refused. YDISK_SERVER_URL может переопределить URL целиком.
+_PORT = os.environ.get("YDISK_PORT", "8001")
+SERVER_URL = os.environ.get("YDISK_SERVER_URL", f"http://127.0.0.1:{_PORT}/api/ingest")
 AUTH_URL = os.environ.get("YDISK_AUTH_URL", SERVER_URL.rsplit("/api/", 1)[0] + "/api/auth")
 
 TARGET_MODEL = "photo-get-clusters-with-resources"
