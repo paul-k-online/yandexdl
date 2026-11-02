@@ -299,6 +299,11 @@ def init_db():
         for col, typ in list(DL_COLUMNS.items()) + list(VD_COLUMNS.items()):
             if col not in cols:
                 c.execute(f"ALTER TABLE items ADD COLUMN {col} {typ}")
+        # ingest_at — когда файл ПОСЛЕДНИЙ раз реально приходил из онлайна (ingest).
+        # Отличается от updated_at (тот меняется и при скачивании/reconcile).
+        # По нему видно, присутствует ли файл в ленте Диска сейчас.
+        if "ingest_at" not in cols:
+            c.execute("ALTER TABLE items ADD COLUMN ingest_at TEXT")
         c.execute("CREATE INDEX IF NOT EXISTS idx_items_dl ON items(dl_status)")
         c.execute("CREATE INDEX IF NOT EXISTS idx_items_vd ON items(vd_status)")
         c.execute("CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT)")
@@ -347,8 +352,8 @@ def upsert_cluster_item(c, cluster_id, it, ts):
     albums = it.get("albums") or []
     c.execute(
         """
-        INSERT INTO items(path, name, taken, mediatype, width, height, item_id, cluster_id, albums, first_seen, updated_at)
-        VALUES(?,?,?,?,?,?,?,?,?,?,?)
+        INSERT INTO items(path, name, taken, mediatype, width, height, item_id, cluster_id, albums, first_seen, updated_at, ingest_at)
+        VALUES(?,?,?,?,?,?,?,?,?,?,?,?)
         ON CONFLICT(path) DO UPDATE SET
             width      = COALESCE(excluded.width,  items.width),
             height     = COALESCE(excluded.height, items.height),
@@ -356,12 +361,13 @@ def upsert_cluster_item(c, cluster_id, it, ts):
             cluster_id = COALESCE(excluded.cluster_id, items.cluster_id),
             albums     = COALESCE(excluded.albums, items.albums),
             mediatype  = COALESCE(items.mediatype, excluded.mediatype),
-            updated_at = excluded.updated_at
+            updated_at = excluded.updated_at,
+            ingest_at  = excluded.ingest_at
         """,
         (
             path, name, taken_from_name(name), guess_mediatype(name, albums),
             it.get("width"), it.get("height"), it.get("itemId"), cluster_id,
-            json.dumps(albums, ensure_ascii=False), ts, ts,
+            json.dumps(albums, ensure_ascii=False), ts, ts, ts,
         ),
     )
 
@@ -376,8 +382,8 @@ def upsert_resource(c, r, ts):
     c.execute(
         """
         INSERT INTO items(path, name, taken, mediatype, mimetype, size, duration_ms,
-                          etime, ctime, mtime, resource_id, file_id, cluster_id, raw, first_seen, updated_at)
-        VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                          etime, ctime, mtime, resource_id, file_id, cluster_id, raw, first_seen, updated_at, ingest_at)
+        VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         ON CONFLICT(path) DO UPDATE SET
             name        = excluded.name,
             mediatype   = COALESCE(excluded.mediatype, items.mediatype),
@@ -391,14 +397,15 @@ def upsert_resource(c, r, ts):
             file_id     = COALESCE(excluded.file_id, items.file_id),
             cluster_id  = COALESCE(items.cluster_id, excluded.cluster_id),
             raw         = excluded.raw,  -- свежий снимок ресурса заменяет устаревшие подписанные download URL
-            updated_at  = excluded.updated_at
+            updated_at  = excluded.updated_at,
+            ingest_at   = excluded.ingest_at  -- видели в онлайне сейчас
         """,
         (
             path, name, taken_from_name(name), meta.get("mediatype"), meta.get("mimetype"),
             meta.get("size"), video_info.get("duration"),
             r.get("etime"), r.get("ctime"), r.get("mtime"),
             meta.get("resource_id"), meta.get("file_id"), r.get("clusterId"),
-            json.dumps(r, ensure_ascii=False), ts, ts,
+            json.dumps(r, ensure_ascii=False), ts, ts, ts,
         ),
     )
 
