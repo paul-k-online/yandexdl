@@ -857,15 +857,17 @@ PAGE = """<!doctype html>
   #viewer .vcaption { position:absolute; left:0; right:0; bottom:-30px; text-align:center; color:#cfcfd6;
                        font-size:12px; word-break:break-all; }
 
-  /* --- вертикальная линейка дат (быстрый переход по годам/месяцам) --- */
-  #timeline { position:fixed; top:0; right:0; width:56px; height:100vh; z-index:50;
-              display:flex; flex-direction:column; align-items:flex-end; justify-content:space-between;
-              padding:10px 8px; user-select:none; }
-  #timeline .tl-item { font-size:11px; color:var(--mut); cursor:pointer; line-height:1.1;
-                       padding:1px 4px; border-radius:6px; white-space:nowrap; }
-  #timeline .tl-item.year { font-size:12px; color:var(--fg); font-weight:600; }
-  #timeline .tl-item:hover { background:var(--cell); color:var(--fg); }
-  #timeline .tl-item.tick { color:var(--line); font-size:9px; }
+  /* --- вертикальная линейка дат: весь диапазон виден сразу (абсолютное
+     позиционирование по высоте экрана, как на Яндекс.Диске) --- */
+  #timeline { position:fixed; top:0; right:0; width:60px; height:100vh; z-index:50;
+              padding:14px 8px; user-select:none; }
+  #timeline .tl-item { position:absolute; right:8px; transform:translateY(-50%);
+                       cursor:pointer; line-height:1; border-radius:6px; white-space:nowrap; }
+  #timeline .tl-item.year { font-size:12px; color:var(--fg); font-weight:600; padding:1px 5px; }
+  #timeline .tl-item.season { width:10px; height:2px; background:var(--line); border-radius:1px;
+                              right:10px; }
+  #timeline .tl-item.year:hover { background:var(--cell); }
+  #timeline .tl-item.season:hover { background:var(--mut); width:16px; }
   #tlBubble { position:fixed; right:60px; z-index:51; background:#2f6fed; color:#fff; font-weight:600;
               font-size:12px; padding:4px 12px; border-radius:16px; white-space:nowrap; pointer-events:none;
               opacity:0; transition:opacity .15s; box-shadow:0 2px 8px rgba(0,0,0,.4); }
@@ -1040,29 +1042,42 @@ PAGE = """<!doctype html>
     } catch (e) { return; }
     if (!months.length) return;
     const tl = document.getElementById('timeline');
-    const years = [...new Set(months.map(x => x.ym.slice(0, 4)))];   // новые -> старые
-    // показываем все годы как подписи, между ними — засечки (точки) месяцев
+    tl.innerHTML = '';
+    // Весь диапазон виден сразу: раскладываем месяцы по ВСЕЙ высоте линейки.
+    // months отсортированы новые->старые; позиция = индекс / (всего-1) -> 0..100%.
+    // top=14px..(100%-14px) чтобы крайние подписи не обрезались.
+    const n = months.length;
+    const posOf = (i) => (n <= 1 ? 0 : i / (n - 1));   // 0 (новые, вверху) .. 1 (старые, внизу)
+    const SEASON = ['зима','зима','весна','весна','весна','лето','лето','лето','осень','осень','осень','зима'];
     const frag = document.createDocumentFragment();
-    let lastYear = null;
-    for (const mo of months) {
+    let lastYear = null, lastSeasonKey = null;
+    months.forEach((mo, i) => {
       const y = mo.ym.slice(0, 4);
+      const m = +mo.ym.slice(5, 7);
+      const topPct = `calc(14px + ${(posOf(i) * 100).toFixed(2)}% * (100vh - 28px) / 100vh)`;
       if (y !== lastYear) {
-        lastYear = y;
+        lastYear = y; lastSeasonKey = null;
         const el = document.createElement('div');
         el.className = 'tl-item year';
+        el.style.top = topPct;
         el.textContent = y;
-        el.title = `${mo.n} в ${MONTHS_SHORT[+mo.ym.slice(5, 7) - 1]} ${y}`;
+        el.title = `${y}`;
         el.onclick = () => jumpTo(mo.ym);
         frag.appendChild(el);
       } else {
-        const el = document.createElement('div');
-        el.className = 'tl-item tick';
-        el.textContent = '·';
-        el.title = `${MONTHS_SHORT[+mo.ym.slice(5, 7) - 1]} ${y} — ${mo.n}`;
-        el.onclick = () => jumpTo(mo.ym);
-        frag.appendChild(el);
+        // засечка по сезону: одна на сезон в пределах года
+        const seasonKey = y + SEASON[m - 1];
+        if (seasonKey !== lastSeasonKey) {
+          lastSeasonKey = seasonKey;
+          const el = document.createElement('div');
+          el.className = 'tl-item season';
+          el.style.top = topPct;
+          el.title = `${SEASON[m - 1]} ${y}`;
+          el.onclick = () => jumpTo(mo.ym);
+          frag.appendChild(el);
+        }
       }
-    }
+    });
     tl.appendChild(frag);
   }
 
